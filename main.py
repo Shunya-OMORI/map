@@ -35,6 +35,7 @@ MOVE_SEC = next(d for name, d in PHASES if name == "MOVE")
 
 COUNTDOWN_SEC = 3.0
 N_TRIALS = 999999  # effectively endless; stop with ESC
+AUTO_STOP_MIN_CLASS_TRIALS = 30
 
 # GSI (Geospatial Information Authority of Japan) tiles
 USE_GSI = True
@@ -44,11 +45,17 @@ GSI_CENTER_LAT = 34.702485  # Osaka Station
 GSI_CENTER_LON = 135.495951
 GSI_ATTRIBUTION = "出典: 国土地理院"
 GSI_TILE_SIZE = 256
-GSI_CELL_TILES = 1  # 1 tile per move
+GSI_CELL_TILES = 2  # 2 tiles per move
 GSI_PREFETCH_ENABLED = True
 GSI_PREFETCH_RADIUS = 5  # tiles (square radius)
 MAX_TILE_CACHE = 512
 TILE_FETCH_TIMEOUT = 4.0
+
+CROSSHAIR_SIZE = 60
+CROSSHAIR_GAP = 8
+CROSSHAIR_OUTER_WIDTH = 4
+CROSSHAIR_INNER_WIDTH = 2
+CROSSHAIR_MAX_OFFSET = 36
 
 ASSET_DIR = Path("assets")
 GSI_CACHE_DIR = ASSET_DIR / "gsi_cache"
@@ -111,12 +118,37 @@ PHASE_BIG_LABELS_JP = {
     "REST": "安静",
 }
 
+TRIAL_CLASS_KEYS = ("up", "down", "left", "right")
+TRIAL_CLASS_LABELS_JP = {
+    "up": "上",
+    "down": "下",
+    "left": "左",
+    "right": "右",
+}
+
 
 @dataclass
 class Command:
     dx: int
     dy: int
     key_name: str
+
+
+class TrialStats:
+    def __init__(self) -> None:
+        self.counts = {key: 0 for key in TRIAL_CLASS_KEYS}
+
+    def record_trial(self, class_key: Optional[str]) -> None:
+        if class_key is None:
+            return
+        self.counts[class_key] += 1
+
+    def should_auto_stop(self, min_trials: int) -> bool:
+        values = list(self.counts.values())
+        return min(values) >= min_trials and len(set(values)) == 1
+
+    def summary_text(self) -> str:
+        return "  ".join(f"{TRIAL_CLASS_LABELS_JP[key]}:{self.counts[key]}" for key in TRIAL_CLASS_KEYS)
 
 
 class SessionLog:
@@ -420,6 +452,10 @@ class TrialController:
         self.view_y = init_view_y
         self.move_start_x = self.view_x
         self.move_start_y = self.view_y
+        self.move_target_x = self.view_x
+        self.move_target_y = self.view_y
+        self.crosshair_offset_x = 0.0
+        self.crosshair_offset_y = 0.0
 
     def t_in_trial(self) -> float:
         return time.perf_counter() - self.trial_start_ts
@@ -436,6 +472,10 @@ class TrialController:
             self.move_dy = 0
             self.move_start_x = self.view_x
             self.move_start_y = self.view_y
+            self.move_target_x = self.view_x
+            self.move_target_y = self.view_y
+            self.crosshair_offset_x = 0.0
+            self.crosshair_offset_y = 0.0
             return True
         return False
 
@@ -453,36 +493,66 @@ class TrialController:
         else:
             self.move_dx, self.move_dy = self.manual_command.dx, self.manual_command.dy
 
-        self.move_start_x = self.view_x
-        self.move_start_y = self.view_y
+        self.move_start_x, self.move_start_y = self._clamp_point(self.view_x, self.view_y)
+        self.move_target_x, self.move_target_y = self._clamp_point(
+            self.move_start_x + self.move_dx * self.cell_size,
+            self.move_start_y + self.move_dy * self.cell_size,
+        )
+        self.crosshair_offset_x = 0.0
+        self.crosshair_offset_y = 0.0
 
-    def _clamp_view(self) -> None:
+    def _clamp_point(self, x: float, y: float) -> tuple[float, float]:
         if self.map_w <= WINDOW_W:
-            self.view_x = self.map_w / 2
+            x = self.map_w / 2
         else:
-            self.view_x = max(WINDOW_W / 2, min(self.map_w - WINDOW_W / 2, self.view_x))
+            x = max(WINDOW_W / 2, min(self.map_w - WINDOW_W / 2, x))
 
         if self.map_h <= WINDOW_H:
-            self.view_y = self.map_h / 2
+            y = self.map_h / 2
         else:
-            self.view_y = max(WINDOW_H / 2, min(self.map_h - WINDOW_H / 2, self.view_y))
+            y = max(WINDOW_H / 2, min(self.map_h - WINDOW_H / 2, y))
+        return x, y
+
+    def _clamp_view(self) -> None:
+        self.view_x, self.view_y = self._clamp_point(self.view_x, self.view_y)
+
+    @staticmethod
+    def _move_profile(alpha: float) -> tuple[float, float]:
+        alpha = max(0.0, min(1.0, alpha))
+        # Cosine easing starts and ends at zero speed.
+        progress = 0.5 - 0.5 * math.cos(math.pi * alpha)
+        speed_ratio = math.sin(math.pi * alpha)
+        return progress, speed_ratio
 
     def update_view(self, phase: str, phase_t: float) -> None:
         if phase != "MOVE":
+            self.crosshair_offset_x = 0.0
+            self.crosshair_offset_y = 0.0
             return
-        target_x = self.move_start_x + self.move_dx * self.cell_size
-        target_y = self.move_start_y + self.move_dy * self.cell_size
-        alpha = min(1.0, phase_t / self.move_sec)
-        self.view_x = self.move_start_x + (target_x - self.move_start_x) * alpha
-        self.view_y = self.move_start_y + (target_y - self.move_start_y) * alpha
+        progress, speed_ratio = self._move_profile(phase_t / self.move_sec)
+        delta_x = self.move_target_x - self.move_start_x
+        delta_y = self.move_target_y - self.move_start_y
+        self.view_x = self.move_start_x + delta_x * progress
+        self.view_y = self.move_start_y + delta_y * progress
         self._clamp_view()
 
+        distance = math.hypot(delta_x, delta_y)
+        if distance <= 0.0:
+            self.crosshair_offset_x = 0.0
+            self.crosshair_offset_y = 0.0
+            return
+
+        distance_ratio = min(1.0, distance / self.cell_size)
+        offset_mag = CROSSHAIR_MAX_OFFSET * distance_ratio * speed_ratio
+        self.crosshair_offset_x = (delta_x / distance) * offset_mag
+        self.crosshair_offset_y = (delta_y / distance) * offset_mag
+
     def finalize_move(self) -> None:
-        target_x = self.move_start_x + self.move_dx * self.cell_size
-        target_y = self.move_start_y + self.move_dy * self.cell_size
-        self.view_x = target_x
-        self.view_y = target_y
+        self.view_x = self.move_target_x
+        self.view_y = self.move_target_y
         self._clamp_view()
+        self.crosshair_offset_x = 0.0
+        self.crosshair_offset_y = 0.0
 
 
 def draw_timeline(screen: pygame.Surface, t_in_trial: float) -> None:
@@ -513,6 +583,20 @@ def label_from_command(cmd: Optional[Command]) -> str:
     if cmd.dx == 1 and cmd.dy == 0:
         return "右"
     return "不明"
+
+
+def class_key_from_command(cmd: Optional[Command]) -> Optional[str]:
+    if cmd is None:
+        return None
+    if cmd.dx == 0 and cmd.dy == -1:
+        return "up"
+    if cmd.dx == 0 and cmd.dy == 1:
+        return "down"
+    if cmd.dx == -1 and cmd.dy == 0:
+        return "left"
+    if cmd.dx == 1 and cmd.dy == 0:
+        return "right"
+    return None
 
 
 def save_snapshot(surface: pygame.Surface, trial_idx: int) -> None:
@@ -561,21 +645,21 @@ def draw_photodiode(screen: pygame.Surface, active: bool) -> None:
         pygame.draw.rect(screen, (255, 255, 255), (x, y, PD_SIZE, PD_SIZE))
 
 
-def draw_crosshair(screen: pygame.Surface) -> None:
-    cx = WINDOW_W // 2
-    cy = WINDOW_H // 2
+def draw_crosshair(screen: pygame.Surface, offset_x: float = 0.0, offset_y: float = 0.0) -> None:
+    cx = WINDOW_W // 2 + int(round(offset_x))
+    cy = WINDOW_H // 2 + int(round(offset_y))
     col = (30, 30, 30)
     col2 = (230, 230, 230)
-    size = 18
-    gap = 6
-    pygame.draw.line(screen, col, (cx - size, cy), (cx - gap, cy), 3)
-    pygame.draw.line(screen, col, (cx + gap, cy), (cx + size, cy), 3)
-    pygame.draw.line(screen, col, (cx, cy - size), (cx, cy - gap), 3)
-    pygame.draw.line(screen, col, (cx, cy + gap), (cx, cy + size), 3)
-    pygame.draw.line(screen, col2, (cx - size, cy), (cx - gap, cy), 1)
-    pygame.draw.line(screen, col2, (cx + gap, cy), (cx + size, cy), 1)
-    pygame.draw.line(screen, col2, (cx, cy - size), (cx, cy - gap), 1)
-    pygame.draw.line(screen, col2, (cx, cy + gap), (cx, cy + size), 1)
+    size = CROSSHAIR_SIZE
+    gap = CROSSHAIR_GAP
+    pygame.draw.line(screen, col, (cx - size, cy), (cx - gap, cy), CROSSHAIR_OUTER_WIDTH)
+    pygame.draw.line(screen, col, (cx + gap, cy), (cx + size, cy), CROSSHAIR_OUTER_WIDTH)
+    pygame.draw.line(screen, col, (cx, cy - size), (cx, cy - gap), CROSSHAIR_OUTER_WIDTH)
+    pygame.draw.line(screen, col, (cx, cy + gap), (cx, cy + size), CROSSHAIR_OUTER_WIDTH)
+    pygame.draw.line(screen, col2, (cx - size, cy), (cx - gap, cy), CROSSHAIR_INNER_WIDTH)
+    pygame.draw.line(screen, col2, (cx + gap, cy), (cx + size, cy), CROSSHAIR_INNER_WIDTH)
+    pygame.draw.line(screen, col2, (cx, cy - size), (cx, cy - gap), CROSSHAIR_INNER_WIDTH)
+    pygame.draw.line(screen, col2, (cx, cy + gap), (cx, cy + size), CROSSHAIR_INNER_WIDTH)
 
 
 def main() -> None:
@@ -599,6 +683,7 @@ def main() -> None:
     controller: Optional[TrialController] = None
     logger: Optional[SessionLog] = None
     prefetcher: Optional[Prefetcher] = None
+    trial_stats = TrialStats()
     abort_discard = False
 
     state = "IDLE"  # IDLE -> COUNTDOWN -> PREFETCH -> RUNNING
@@ -668,6 +753,7 @@ def main() -> None:
                 last_phase_name = ""
         elif state == "RUNNING" and controller is not None and logger is not None:
             phase, phase_t = controller.phase()
+            completed_class_key = class_key_from_command(controller.manual_command)
 
             if phase != last_phase_name:
                 last_phase_name = phase
@@ -720,7 +806,10 @@ def main() -> None:
                 controller.view_y,
             )
 
-            controller.advance_if_needed()
+            if controller.advance_if_needed():
+                trial_stats.record_trial(completed_class_key)
+                if trial_stats.should_auto_stop(AUTO_STOP_MIN_CLASS_TRIALS):
+                    running = False
 
             if controller.trial_idx >= N_TRIALS:
                 running = False
@@ -752,7 +841,7 @@ def main() -> None:
                 screen.blit(sub, (WINDOW_W // 2 - sub.get_width() // 2, 300))
         elif state == "RUNNING" and controller is not None:
             world.render(screen, controller.view_x, controller.view_y)
-            draw_crosshair(screen)
+            draw_crosshair(screen, controller.crosshair_offset_x, controller.crosshair_offset_y)
 
             phase, phase_t = controller.phase()
             col = PHASE_COLORS.get(phase, (80, 80, 80))
@@ -776,10 +865,24 @@ def main() -> None:
             cmd_label = font_small.render(f"手動入力: {cmd_txt}", True, (30, 30, 30))
             screen.blit(cmd_label, (14, 120))
 
+            class_count = font_small.render(
+                f"4クラス試行数  {trial_stats.summary_text()}",
+                True,
+                (30, 30, 30),
+            )
+            screen.blit(class_count, (14, 146))
+
+            stop_rule = font_small.render(
+                f"自動終了: 各クラス{AUTO_STOP_MIN_CLASS_TRIALS}試行以上かつ同数",
+                True,
+                (30, 30, 30),
+            )
+            screen.blit(stop_rule, (14, 172))
+
             snap_hint = font_small.render("Sキーで地図画像保存", True, (30, 30, 30))
-            screen.blit(snap_hint, (14, 146))
+            screen.blit(snap_hint, (14, 198))
             esc = font_small.render("ESC: 現在の試行を破棄して終了", True, (30, 30, 30))
-            screen.blit(esc, (14, 172))
+            screen.blit(esc, (14, 224))
 
             if USE_GSI:
                 attr = font_small.render(GSI_ATTRIBUTION, True, (255, 255, 255))
